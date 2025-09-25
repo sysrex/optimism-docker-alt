@@ -1,0 +1,204 @@
+name: op-stack-rollup
+
+x-common-env: &common-env # ---------- L1 / Global ----------
+  L1_RPC_URL: ${L1_RPC_URL} # e.g. https://sepolia.infura.io/v3/<KEY>
+  L1_RPC_KIND: ${L1_RPC_KIND:-basic} # basic|quicknode|erigon|nethermind|geth (match your provider)
+  L1_CHAIN_ID: ${L1_CHAIN_ID:-11155111} # Sepolia
+  L2_CHAIN_ID: ${L2_CHAIN_ID:-42083} # your test L2 chain ID
+
+  # ---------- Wallets (fill these) ----------
+  GS_ADMIN_PRIVATE_KEY: ${GS_ADMIN_PRIVATE_KEY} # for op-deployer (not used by services here)
+  GS_SEQUENCER_PRIVATE_KEY: ${GS_SEQUENCER_PRIVATE_KEY} # used by op-node (sequencer key)
+  GS_BATCHER_PRIVATE_KEY: ${GS_BATCHER_PRIVATE_KEY} # used by op-batcher
+  GS_PROPOSER_PRIVATE_KEY: ${GS_PROPOSER_PRIVATE_KEY} # used by op-proposer
+
+  # ---------- Files (mounted under /config in containers) ----------
+  ROLLUP_CONFIG: /config/rollup.json
+  GENESIS_FILE: /config/genesis.json
+  JWT_FILE: /config/jwt.txt
+
+  CELESTIA_BRIDGE: ${CELESTIA_BRIDGE}
+  CELESTIA_AUTH_TOKEN: ${CELESTIA_AUTH_TOKEN}
+  CELESTIA_NAMESPACE: ${CELESTIA_NAMESPACE}
+networks:
+  opnet:
+    driver: bridge
+
+volumes:
+  shared:
+
+services:
+  op-geth-init:
+    image: sysrex/op-geth:v1.101602.3
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+        - |
+          if [ -f /data/geth/chaindata/CURRENT ] || [ -d /data/geth/chaindata ]; then
+            echo "op-geth data found in /data, skipping genesis init"
+          else
+            echo "No op-geth data found, initializing genesis..."
+            geth init --datadir=/data /config/genesis.json
+          fi
+    environment:
+      <<: *common-env
+    volumes:
+      - ./op-geth/data:/data
+      - ./config:/config:ro
+
+  op-geth:
+    image: sysrex/op-geth:v1.101602.3
+    depends_on:
+      op-geth-init:
+        condition:
+          service_completed_successfully
+    command:
+      - --datadir=/data
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.vhosts=*
+      - --http.corsdomain=*
+      - --http.api=web3,debug,eth,txpool,net,engine,miner
+      - --ws
+      - --ws.addr=0.0.0.0
+      - --ws.port=8546
+      - --ws.origins=*
+      - --ws.api=debug,eth,txpool,net,engine,miner
+      - --syncmode=full
+      - --gcmode=archive # sequencer requirement
+      - --nodiscover
+      - --maxpeers=0
+      - --authrpc.addr=0.0.0.0
+      - --authrpc.port=8551
+      - --authrpc.vhosts=*
+      - --authrpc.jwtsecret=/config/jwt.txt
+      - --rollup.disabletxpoolgossip=true
+      - --ipcdisable
+
+    environment:
+      <<: *common-env
+    ports:
+      - "8545:8545" # JSON-RPC
+      - "8546:8546" # WS
+      - "8551:8551" # Engine API (JWT)
+    volumes:
+      - ./op-geth/data:/data
+      - ./config:/config:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8545"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+    networks: [opnet]
+
+  op-node:
+    image: sysrex/op-node:v1.13.7
+    depends_on:
+      op-geth:
+        condition: service_healthy
+    command:
+      - op-node
+      - --l2=http://op-geth:8551
+      - --l2.jwt-secret=/config/jwt.txt
+      - --sequencer.enabled
+      - --sequencer.l1-confs=5
+      - --verifier.l1-confs=4
+      - --rollup.config=/config/rollup.json
+      - --rpc.addr=0.0.0.0
+      - --rpc.port=9545
+      - --rpc.enable-admin
+      - --p2p.disable
+      - --p2p.sequencer.key=${GS_SEQUENCER_PRIVATE_KEY}
+      - --l1=${L1_RPC_URL}
+      - --l1.beacon=${L1_RPC_URL}
+      - --l1.rpckind=${L1_RPC_KIND}
+      - --l1.trustrpc
+      - --altda.enabled=true
+      - --altda.verify-on-read=true
+      - --altda.da-server=http://op-alt-da:3100 # this goes to the Alt DA Server
+    environment:
+      <<: *common-env
+    ports:
+      - "9545:9545" # op-node RPC
+    volumes:
+      - ./config:/config:ro
+      - shared:/shared
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9545"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+    networks: [opnet]
+
+  op-batcher:
+    image: sysrex/op-batcher:v1.15.0
+    depends_on:
+      op-geth:
+        condition: service_healthy
+      op-node:
+        condition: service_healthy
+    command:
+      - op-batcher
+      - --l2-eth-rpc=http://op-geth:8545
+      - --rollup-rpc=http://op-node:9545
+      - --poll-interval=1s
+      - --sub-safety-margin=6
+      - --num-confirmations=1
+      - --safe-abort-nonce-too-low-count=3
+      - --resubmission-timeout=30s
+      - --rpc.addr=0.0.0.0
+      - --rpc.port=8548
+      - --max-channel-duration=25
+      - --l1-eth-rpc=${L1_RPC_URL}
+      - --private-key=${GS_BATCHER_PRIVATE_KEY}
+      - --altda.da-service=true
+      - --altda.enabled=true
+      - --altda.da-server=http://op-alt-da:3100
+    environment:
+      <<: *common-env
+    ports:
+      - "8548:8548" # batcher admin RPC (optional)
+    networks: [opnet]
+
+  op-proposer:
+    image: sysrex/op-proposer:v1.10.0
+    depends_on:
+      op-node:
+        condition: service_healthy
+    command:
+      - op-proposer
+      - --poll-interval=12s
+      - --rpc.port=8560
+      - --rollup-rpc=http://op-node:9545
+      - --game-factory-address=${GAME_FACTORY_ADDRESS}
+      - --proposal-interval=6h
+      - --private-key=${GS_PROPOSER_PRIVATE_KEY}
+      - --l1-eth-rpc=${L1_RPC_URL}
+    environment:
+      <<: *common-env
+    ports:
+      - "8560:8560"
+    networks: [opnet]
+
+  op-alt-da:
+    image: ghcr.io/celestiaorg/op-plasma-celestia:0.7.0
+    depends_on:
+      op-geth:
+        condition: service_healthy
+    command:
+      - --log.level=trace
+      - --addr=0.0.0.0
+      - --port=3100
+      - --celestia.server=${CELESTIA_BRIDGE}
+      - --celestia.auth-token=${CELESTIA_AUTH_TOKEN}
+      - --celestia.namespace=${CELESTIA_NAMESPACE}
+      - --celestia.tls-enabled=false
+    environment:
+      <<: *common-env
+    ports:
+      - "3100:3100"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3100/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+    networks: [opnet]
